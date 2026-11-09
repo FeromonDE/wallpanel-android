@@ -48,24 +48,7 @@ class InternalWebChromeClient(val resources: Resources, val callback: WebClientC
 
     @RequiresApi(Build.VERSION_CODES.LOLLIPOP)
     override fun onPermissionRequest(request: PermissionRequest?) {
-        super.onPermissionRequest(request)
-        callback.setWebkitPermissionRequest(request)
-        request?.resources?.forEach {
-            when (it) {
-                PermissionRequest.RESOURCE_AUDIO_CAPTURE -> {
-                    callback.askForWebkitPermission(
-                        it,
-                        BaseBrowserActivity.REQUEST_CODE_PERMISSION_AUDIO
-                    )
-                }
-                PermissionRequest.RESOURCE_VIDEO_CAPTURE -> {
-                    callback.askForWebkitPermission(
-                        it,
-                        BaseBrowserActivity.REQUEST_CODE_PERMISSION_CAMERA
-                    )
-                }
-            }
-        }
+        request?.let(callback::requestWebkitPermission)
     }
 
     override fun onJsAlert(
@@ -74,12 +57,15 @@ class InternalWebChromeClient(val resources: Resources, val callback: WebClientC
         message: String,
         result: JsResult
     ): Boolean {
-        if (view.context != null && !callback.isFinishing()) {
-            AlertDialog.Builder(view.context)
-                .setMessage(message)
-                .setPositiveButton(android.R.string.ok, null)
-                .show()
+        if (callback.isFinishing()) {
+            result.cancel()
+            return true
         }
+        AlertDialog.Builder(view.context)
+            .setMessage(message)
+            .setPositiveButton(android.R.string.ok) { _, _ -> result.confirm() }
+            .setOnCancelListener { result.cancel() }
+            .show()
         return true
     }
 
