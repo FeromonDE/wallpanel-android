@@ -44,17 +44,16 @@ constructor(private val context: Context){
     private val batteryHandler = Handler(Looper.getMainLooper())
     private var updateFrequencyMilliSeconds: Int = 0
     private var callback: SensorCallback? = null
-    private var sensorsPublished: Boolean = false
-    private var lightSensorEvent: SensorEvent? = null
+    // Limit publications to one reading per sensor during each configured period.
+    private val publishedSensorTypes = mutableSetOf<Int>()
 
     private val batteryHandlerRunnable = object : Runnable {
         override fun run() {
             if (updateFrequencyMilliSeconds > 0) {
                 Timber.d("Updating Battery")
                 getBatteryReading()
-                batteryHandler.removeCallbacksAndMessages(null)
+                publishedSensorTypes.clear()
                 batteryHandler.postDelayed(this, updateFrequencyMilliSeconds.toLong())
-                sensorsPublished = false
             }
         }
     }
@@ -76,9 +75,11 @@ constructor(private val context: Context){
         Timber.d("startReadings")
         this.callback = callback
         if (freqSeconds >= 0) {
-            updateFrequencyMilliSeconds = 1000 * freqSeconds
+            updateFrequencyMilliSeconds = (freqSeconds.coerceAtLeast(1).toLong() * 1000L)
+                .coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+            publishedSensorTypes.clear()
             batteryHandler.removeCallbacksAndMessages(null)
-            batteryHandler.postDelayed(batteryHandlerRunnable, updateFrequencyMilliSeconds.toLong())
+            batteryHandler.post(batteryHandlerRunnable)
             startSensorReadings()
         }
     }
@@ -94,7 +95,9 @@ constructor(private val context: Context){
         Timber.d("stopReadings")
         batteryHandler.removeCallbacksAndMessages(null)
         updateFrequencyMilliSeconds = 0
+        publishedSensorTypes.clear()
         stopSensorReading()
+        callback = null
     }
 
     private fun publishSensorData(sensorName: String?, sensorData: JSONObject) {
@@ -157,7 +160,9 @@ constructor(private val context: Context){
         Timber.d("startSensorReadings")
         if(mSensorManager != null) {
             for (sensor in mSensorList) {
-                mSensorManager.registerListener(sensorListener, sensor, 1000)
+                // SensorManager uses microseconds, not milliseconds: 1s is ample
+                // for HA telemetry and avoids a 1ms sampling request on Android 7.
+                mSensorManager.registerListener(sensorListener, sensor, 1_000_000)
             }
         }
     }
@@ -174,24 +179,12 @@ constructor(private val context: Context){
 
     private val sensorListener = object : SensorEventListener {
         override fun onSensorChanged(event: SensorEvent?) {
-            if(event != null && !sensorsPublished) {
-                var data = JSONObject()
-                if(event.sensor.type == Sensor.TYPE_LIGHT) {
-                    lightSensorEvent = event
-                }
-                if(lightSensorEvent != null) {
-                    data.put(VALUE, lightSensorEvent!!.values[0])
-                    data.put(UNIT, getSensorUnit(lightSensorEvent!!.sensor.type))
-                    data.put(ID, lightSensorEvent!!.sensor.name)
-                    publishSensorData(getSensorName(lightSensorEvent!!.sensor.type), data)
-                }
-                data = JSONObject()
-                data.put(VALUE, event.values[0])
-                data.put(UNIT, getSensorUnit(event.sensor.type))
-                data.put(ID, event.sensor.name)
-                publishSensorData(getSensorName(event.sensor.type), data)
-                sensorsPublished = true
-            }
+            if (event == null || !publishedSensorTypes.add(event.sensor.type)) return
+            val data = JSONObject()
+            data.put(VALUE, event.values[0])
+            data.put(UNIT, getSensorUnit(event.sensor.type))
+            data.put(ID, event.sensor.name)
+            publishSensorData(getSensorName(event.sensor.type), data)
         }
         override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {
         }
