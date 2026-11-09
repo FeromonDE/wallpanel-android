@@ -54,12 +54,10 @@ android {
         vectorDrawables.useSupportLibrary = true
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
     }
+    // One universal APK for Android 7 tablets; no unused ABI-specific releases.
     splits {
         abi {
-            reset()
-            enable true
-            universalApk true
-            include "armeabi-v7a", "x86", "arm64-v8a", "x86_64"
+            enable false
         }
     }
     buildTypes {
