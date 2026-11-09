@@ -58,7 +58,7 @@ class BrowserActivityNative : BaseBrowserActivity(), LifecycleObserver, WebClien
     private lateinit var webView: WebView
     private lateinit var binding: ActivityBrowserBinding
     private var certPermissionsShown = false
-    private var playlistHandler: Handler? = null
+    private val playlistHandler = Handler(Looper.getMainLooper())
     private var codeBottomSheet: CodeBottomSheetFragment? = null
     private var webSettings: WebSettings? = null
     private val calendar: Calendar = Calendar.getInstance()
@@ -77,15 +77,13 @@ class BrowserActivityNative : BaseBrowserActivity(), LifecycleObserver, WebClien
 
     private val playlistRunnable = object : Runnable {
         override fun run() {
-            // TODO: allow users to set their own value in settings
-            val offset = 60L - calendar.get(Calendar.SECOND)
-            val urls: List<String> = configuration.appLaunchUrl.lines()
-            // Avoid IndexOutOfBound
+            val urls = configuration.appLaunchUrl.lines().map { it.trim() }.filter { it.isNotEmpty() }
+            if (urls.isEmpty() || isFinishing || isDestroyed) return
+            loadWebViewUrl(urls[playlistIndex % urls.size])
             playlistIndex = (playlistIndex + 1) % urls.size
-            if (urls.isNotEmpty() && urls.size >= playlistIndex) {
-                loadWebViewUrl(urls[playlistIndex])
-                playlistHandler?.postDelayed(this, TimeUnit.SECONDS.toMillis(offset))
-            }
+            val minute = TimeUnit.MINUTES.toMillis(1)
+            val delay = minute - System.currentTimeMillis() % minute
+            playlistHandler.postDelayed(this, delay)
         }
     }
 
@@ -167,15 +165,26 @@ class BrowserActivityNative : BaseBrowserActivity(), LifecycleObserver, WebClien
 
     override fun onStop() {
         super.onStop()
-        val view = binding.root
-        if (mOnScrollChangedListener != null && configuration.browserRefresh) {
-            binding.swipeContainer.viewTreeObserver.removeOnScrollChangedListener(mOnScrollChangedListener)
+        mOnScrollChangedListener?.let {
+            binding.swipeContainer.viewTreeObserver.removeOnScrollChangedListener(it)
         }
+        mOnScrollChangedListener = null
     }
 
     override fun onDestroy() {
+        playlistHandler.removeCallbacksAndMessages(null)
+        reconnectionHandler.removeCallbacksAndMessages(null)
+        connectionLiveData?.removeObservers(this)
+        if (::webView.isInitialized) {
+            webView.stopLoading()
+            webView.webChromeClient = null
+            webView.webViewClient = WebViewClient()
+            (webView.parent as? ViewGroup)?.removeView(webView)
+            webView.destroy()
+        }
+        webSettings = null
+        codeBottomSheet?.dismissAllowingStateLoss()
         super.onDestroy()
-        codeBottomSheet?.dismiss()
     }
 
     override fun openSettings() {
@@ -214,10 +223,8 @@ class BrowserActivityNative : BaseBrowserActivity(), LifecycleObserver, WebClien
     }
 
     override fun clearCache() {
+        // Refresh the cache without logging users out of Home Assistant.
         webView.clearCache(true)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            CookieManager.getInstance().removeAllCookies(null)
-        }
     }
 
     override fun reload() {
@@ -235,7 +242,7 @@ class BrowserActivityNative : BaseBrowserActivity(), LifecycleObserver, WebClien
         webSettings?.databaseEnabled = true
         webSettings?.saveFormData = true
         webSettings?.javaScriptCanOpenWindowsAutomatically = true
-        webSettings?.cacheMode = WebSettings.LOAD_NO_CACHE
+        webSettings?.cacheMode = WebSettings.LOAD_DEFAULT
         webSettings?.allowFileAccess = true
         webSettings?.allowFileAccessFromFileURLs = true
         webSettings?.allowContentAccess = true
@@ -272,7 +279,8 @@ class BrowserActivityNative : BaseBrowserActivity(), LifecycleObserver, WebClien
 
     override fun startReloadDelay() {
         awaitingReconnect = true
-        playlistHandler?.removeCallbacksAndMessages(null)
+        playlistHandler.removeCallbacks(playlistRunnable)
+        reconnectionHandler.removeCallbacks(reloadPageRunnable)
         reconnectionHandler.postDelayed(reloadPageRunnable, 30000)
     }
 
@@ -326,7 +334,7 @@ class BrowserActivityNative : BaseBrowserActivity(), LifecycleObserver, WebClien
     @SuppressLint("ClickableViewAccessibility")
     private fun configureWebView(view: ViewGroup) {
         webView = binding.activityBrowserWebviewNative
-        webView.setLayerType(View.LAYER_TYPE_SOFTWARE, null)
+        // Let onStart select the rendering layer according to the saved preference.
         // Force links and redirects to open in the WebView instead of in a browser
         configureWebChromeClient()
         configureWebViewClient()
@@ -365,17 +373,20 @@ class BrowserActivityNative : BaseBrowserActivity(), LifecycleObserver, WebClien
             val zoomPercent = (zoomLevel * 100).toInt()
             webView.setInitialScale(zoomPercent)
         }
-        // check if we are using playlist
-        if (configuration.appLaunchUrl.lines().size == 1) {
-            loadWebViewUrl(configuration.appLaunchUrl)
-        } else {
-            startPlaylist()
+        // Never leave multiple scheduled playlist updates after a reload or reconnect.
+        playlistHandler.removeCallbacks(playlistRunnable)
+        val urls = configuration.appLaunchUrl.lines().map { it.trim() }.filter { it.isNotEmpty() }
+        when (urls.size) {
+            0 -> Unit
+            1 -> loadWebViewUrl(urls.first())
+            else -> startPlaylist()
         }
     }
 
     private fun startPlaylist() {
-        playlistHandler = Handler(Looper.getMainLooper())
-        playlistHandler?.postDelayed(playlistRunnable, 10)
+        playlistHandler.removeCallbacks(playlistRunnable)
+        playlistIndex = 0
+        playlistHandler.post(playlistRunnable)
     }
 
 
