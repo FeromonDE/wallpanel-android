@@ -1,6 +1,9 @@
 package xyz.wallpanel.app.utils
 
 import android.annotation.TargetApi
+import android.webkit.WebResourceError
+import android.webkit.WebResourceRequest
+import androidx.appcompat.app.AlertDialog
 import android.content.res.Resources
 import android.graphics.Bitmap
 import android.net.http.SslError
@@ -27,14 +30,10 @@ open class InternalWebClient(val resources: Resources, private val callback: Web
     private var currentUrl = ""
 
     override fun shouldOverrideUrlLoading(view: WebView, url: String): Boolean {
-        if (currentUrl.equals(url, ignoreCase = true)) {
-            return false;
-        }
-        else if (!currentUrl.equals(url, ignoreCase = true)){
-            currentUrl = url;
-            view.loadUrl(currentUrl);
-        }
-        return true;
+        // Let WebView navigate directly. Calling loadUrl() here caused redundant
+        // requests and interfered with redirects on older Chromium versions.
+        currentUrl = url
+        return false
     }
 
     open fun isCurrentUrl(url: String): Boolean {
@@ -45,9 +44,8 @@ open class InternalWebClient(val resources: Resources, private val callback: Web
         webView: WebView?, url: String,
         bitmap: Bitmap?
     ) {
-        if (isCurrentUrl(url)) {
-            pageLoaded = false
-        }
+        currentUrl = url
+        pageLoaded = false
     }
 
     // TODO load a special file here on disconnect and then reload page on timer
@@ -57,12 +55,25 @@ open class InternalWebClient(val resources: Resources, private val callback: Web
         description: String,
         failingUrl: String
     ) {
-        if (!callback.isFinishing()) {
-            view.loadUrl("about:blank")
-            view.loadUrl("file:///android_asset/error_page.html")
-            callback.isConnected = false
-            callback.startReloadDelay()
+        showMainFrameError(view, failingUrl)
+    }
+
+    @TargetApi(Build.VERSION_CODES.M)
+    override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
+        // On Android 7 this callback also fires for images, fonts and other
+        // subresources. A failed image must not replace the whole dashboard.
+        if (request.isForMainFrame) {
+            showMainFrameError(view, request.url.toString())
         }
+    }
+
+    private fun showMainFrameError(view: WebView, failingUrl: String) {
+        if (callback.isFinishing() ||
+            failingUrl.startsWith("file:///android_asset/") ||
+            failingUrl == "about:blank") return
+        view.loadUrl("file:///android_asset/error_page.html")
+        callback.isConnected = false
+        callback.startReloadDelay()
     }
 
     override fun onReceivedSslError(
@@ -70,7 +81,11 @@ open class InternalWebClient(val resources: Resources, private val callback: Web
         handler: SslErrorHandler,
         error: SslError
     ) {
-        if (!callback.certPermissionsShown() && !callback.isFinishing() && configuration.ignoreSSLErrors) {
+        if (!configuration.ignoreSSLErrors || callback.isFinishing()) {
+            handler.cancel()
+            return
+        }
+        if (!callback.certPermissionsShown()) {
             var message = resources.getString(R.string.dialog_message_ssl_generic)
             when (error?.primaryError) {
                 SslError.SSL_UNTRUSTED -> message =
@@ -83,13 +98,13 @@ open class InternalWebClient(val resources: Resources, private val callback: Web
                     resources.getString(R.string.dialog_message_ssl_not_yet_valid)
             }
             message += resources.getString(xyz.wallpanel.app.R.string.dialog_message_ssl_continue)
-            dialogUtils.showAlertDialog(view.context,
-                resources.getString(R.string.dialog_title_ssl_error),
-                resources.getString(R.string.dialog_message_ssl_continue),
-                resources.getString(R.string.button_continue),
-                { _, _ -> handler.proceed() },
-                { _, _ -> handler.proceed() }
-            )
+            AlertDialog.Builder(view.context)
+                .setTitle(resources.getString(R.string.dialog_title_ssl_error))
+                .setMessage(message)
+                .setPositiveButton(resources.getString(R.string.button_continue)) { _, _ -> handler.proceed() }
+                .setNegativeButton(android.R.string.cancel) { _, _ -> handler.cancel() }
+                .setOnCancelListener { handler.cancel() }
+                .show()
         } else {
             handler.proceed()
         }
