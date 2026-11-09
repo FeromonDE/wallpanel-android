@@ -271,10 +271,6 @@ class BrowserActivityNative : BaseBrowserActivity(), LifecycleObserver, WebClien
         }
     }
 
-    override fun setWebkitPermissionRequest(request: PermissionRequest?) {
-        webkitPermissionRequest = request
-    }
-
     override fun displayProgress(): Boolean {
         return displayProgress
     }
