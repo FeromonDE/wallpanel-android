@@ -26,7 +26,10 @@ import android.net.ConnectivityManager
 import timber.log.Timber
 import java.util.concurrent.atomic.AtomicBoolean
 
-class ConnectionLiveData(private val context: Context) : MutableLiveData<Boolean>() {
+class ConnectionLiveData(context: Context) : MutableLiveData<Boolean>() {
+
+    // A network observer must not keep a destroyed Activity alive.
+    private val appContext = context.applicationContext
 
     private var connCallbackListener: ConnCallbackListener? = null
 
@@ -43,27 +46,28 @@ class ConnectionLiveData(private val context: Context) : MutableLiveData<Boolean
 
     override fun onActive() {
         super.onActive()
-        context.registerReceiver(connectionReceiver, IntentFilter(ConnectivityManager.CONNECTIVITY_ACTION))
+        appContext.registerReceiver(connectionReceiver, IntentFilter(ConnectivityManager.CONNECTIVITY_ACTION))
+        updateNetworkStatus()
     }
 
     override fun onInactive() {
         super.onInactive()
-        context.unregisterReceiver(connectionReceiver)
+        appContext.unregisterReceiver(connectionReceiver)
     }
 
     private val connectionReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
-            val connectivityManager = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-            val currentNetworkInfo = connectivityManager.activeNetworkInfo
-            if (currentNetworkInfo != null && currentNetworkInfo.isConnected) {
-                Timber.d("Network Connected")
-                hasNetwork.set(true)
-                value = true
-            } else if (hasNetwork.get()) {
-                Timber.d("Network Disconnected")
-                hasNetwork.set(false)
-                value = false
-            }
+            updateNetworkStatus()
+        }
+    }
+
+    private fun updateNetworkStatus() {
+        val manager = appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val connected = manager.activeNetworkInfo?.isConnected == true
+        hasNetwork.set(connected)
+        if (value != connected) {
+            Timber.d("Network connected: %s", connected)
+            value = connected
         }
     }
 
