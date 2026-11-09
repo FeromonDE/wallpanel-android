@@ -174,6 +174,8 @@ class BrowserActivityNative : BaseBrowserActivity(), LifecycleObserver, WebClien
     override fun onDestroy() {
         playlistHandler.removeCallbacksAndMessages(null)
         reconnectionHandler.removeCallbacksAndMessages(null)
+        webkitPermissionRequest?.deny()
+        webkitPermissionRequest = null
         connectionLiveData?.removeObservers(this)
         if (::webView.isInitialized) {
             webView.stopLoading()
@@ -294,24 +296,54 @@ class BrowserActivityNative : BaseBrowserActivity(), LifecycleObserver, WebClien
     }
 
     @RequiresApi(Build.VERSION_CODES.LOLLIPOP)
-    override fun askForWebkitPermission(permission: String, requestCode: Int) {
-        if (ContextCompat.checkSelfPermission(
-                applicationContext,
-                permission
-            ) != PackageManager.PERMISSION_GRANTED
-        ) {
-            // Should we show an explanation?
-            if (ActivityCompat.shouldShowRequestPermissionRationale(this, permission)) {
-                // Show an explanation to the user *asynchronously* -- don't block
-                // this thread waiting for the user's response! After the user
-                // sees the explanation, try again to request the permission.
-            } else {
-                // No explanation needed, we can request the permission.
-                ActivityCompat.requestPermissions(this, arrayOf(permission), requestCode)
+    override fun requestWebkitPermission(request: PermissionRequest) {
+        val permissions = mutableSetOf<String>()
+        for (resource in request.resources) {
+            when (resource) {
+                PermissionRequest.RESOURCE_AUDIO_CAPTURE ->
+                    permissions.add(android.Manifest.permission.RECORD_AUDIO)
+                PermissionRequest.RESOURCE_VIDEO_CAPTURE ->
+                    permissions.add(android.Manifest.permission.CAMERA)
+                else -> {
+                    request.deny()
+                    return
+                }
             }
-        } else {
-            webkitPermissionRequest?.grant(webkitPermissionRequest?.resources)
         }
+
+        val missing = permissions.filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+        if (missing.isEmpty()) {
+            request.grant(request.resources)
+        } else {
+            webkitPermissionRequest?.deny()
+            webkitPermissionRequest = request
+            ActivityCompat.requestPermissions(
+                this, missing.toTypedArray(), REQUEST_CODE_PERMISSION_CAMERA
+            )
+        }
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode != REQUEST_CODE_PERMISSION_CAMERA) return
+        val request = webkitPermissionRequest ?: return
+        webkitPermissionRequest = null
+        val granted = request.resources.all { resource ->
+            val permission = when (resource) {
+                PermissionRequest.RESOURCE_AUDIO_CAPTURE -> android.Manifest.permission.RECORD_AUDIO
+                PermissionRequest.RESOURCE_VIDEO_CAPTURE -> android.Manifest.permission.CAMERA
+                else -> null
+            }
+            permission != null &&
+                ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
+        }
+        if (granted) request.grant(request.resources) else request.deny()
     }
 
     private fun configureConnection() {
