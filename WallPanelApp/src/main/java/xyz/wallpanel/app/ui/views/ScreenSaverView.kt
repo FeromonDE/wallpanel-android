@@ -29,6 +29,7 @@ import android.util.AttributeSet
 import android.util.TypedValue
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewGroup
 import android.webkit.*
 import android.widget.RelativeLayout
 import android.widget.Toast
@@ -76,13 +77,11 @@ class ScreenSaverView : RelativeLayout {
 
             try {
                 if (width > 0 && height > 0 && parentWidth > 0 && parentHeight > 0) {
-                    if (parentHeight - width > 0) {
-                        val newX = Random().nextInt(parentWidth - width)
-                        binding.screenSaverClockLayout.x = newX.toFloat()
+                    if (parentWidth > width) {
+                        binding.screenSaverClockLayout.x = Random().nextInt(parentWidth - width + 1).toFloat()
                     }
-                    if (parentHeight - height > 0) {
-                        val newY = Random().nextInt(parentHeight - height)
-                        binding.screenSaverClockLayout.y = newY.toFloat()
+                    if (parentHeight > height) {
+                        binding.screenSaverClockLayout.y = Random().nextInt(parentHeight - height + 1).toFloat()
                     }
                 }
             } catch (e: IllegalArgumentException) {
@@ -115,13 +114,27 @@ class ScreenSaverView : RelativeLayout {
     }
 
     override fun onDetachedFromWindow() {
+        timeHandler?.removeCallbacksAndMessages(null)
+        wallPaperHandler?.removeCallbacksAndMessages(null)
+        timeHandler = null
+        wallPaperHandler = null
+        if (::binding.isInitialized) {
+            Glide.with(context.applicationContext).clear(binding.screenSaverImageLayout)
+            val webView = binding.screenSaverWebView
+            webView.stopLoading()
+            webView.onPause()
+            webView.webChromeClient = null
+            webView.webViewClient = WebViewClient()
+            (webView.parent as? ViewGroup)?.removeView(webView)
+            webView.destroy()
+        }
         super.onDetachedFromWindow()
-        timeHandler?.removeCallbacks(timeRunnable)
-        wallPaperHandler?.removeCallbacks(wallPaperRunnable)
     }
 
     fun init(hasWeb: Boolean, urlWeb: String, hasWallpaper: Boolean, hasClock: Boolean, rotationDelay: Long) {
-        rotationInterval = rotationDelay
+        timeHandler?.removeCallbacksAndMessages(null)
+        wallPaperHandler?.removeCallbacksAndMessages(null)
+        rotationInterval = rotationDelay.coerceAtLeast(1L)
         showWebPage = hasWeb
         webUrl = urlWeb
         showWallpaper = hasWallpaper
@@ -180,13 +193,13 @@ class ScreenSaverView : RelativeLayout {
     private fun loadWebPage(url: String) {
         Timber.d("loadWebPage url ${url}")
         configureWebSettings("")
-        clearCache()
         binding.screenSaverWebView.webChromeClient = object : WebChromeClient() {
             override fun onJsAlert(view: WebView, url: String, message: String, result: JsResult): Boolean {
                 AlertDialog.Builder(view.context, R.style.CustomAlertDialog)
                         .setTitle(context.getString(R.string.dialog_title_ssl_error))
                         .setMessage(message)
-                        .setPositiveButton(android.R.string.ok, null)
+                        .setPositiveButton(android.R.string.ok) { _, _ -> result.confirm() }
+                        .setOnCancelListener { result.cancel() }
                         .show()
                 return true
             }
@@ -245,7 +258,7 @@ class ScreenSaverView : RelativeLayout {
         webSettings.javaScriptEnabled = true
         webSettings.domStorageEnabled = true
         webSettings.databaseEnabled = true
-        webSettings.cacheMode = WebSettings.LOAD_NO_CACHE
+        webSettings.cacheMode = WebSettings.LOAD_DEFAULT
         webSettings.javaScriptCanOpenWindowsAutomatically = true
         if (!TextUtils.isEmpty(userAgent)) {
             webSettings.userAgentString = userAgent
