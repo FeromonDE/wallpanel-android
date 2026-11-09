@@ -99,6 +99,7 @@ class WallPanelService : LifecycleService(), MQTTModule.MQTTListener {
     lateinit var screenUtils: ScreenUtils
 
     private val mJpegSockets = ArrayList<AsyncHttpServerResponse>()
+    private var mjpegObserverAttached = false
     private var partialWakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
     private var keyguardLock: KeyguardManager.KeyguardLock? = null
@@ -192,19 +193,32 @@ class WallPanelService : LifecycleService(), MQTTModule.MQTTListener {
     }
 
     override fun onDestroy() {
-        super.onDestroy()
         mqttModule?.let {
             it.pause()
             mqttModule = null
         }
-        if (localBroadCastManager != null) {
-            localBroadCastManager?.unregisterReceiver(mBroadcastReceiver)
-        }
-        cameraReader?.stopCamera()
-        sensorReader.stopReadings()
+        localBroadCastManager?.unregisterReceiver(mBroadcastReceiver)
+        localBroadCastManager = null
         stopHttp()
+        cameraReader?.stopCamera()
+        cameraReader = null
+        sensorReader.stopReadings()
         stopPowerOptions()
         reconnectHandler.removeCallbacksAndMessages(null)
+        motionClearHandler.removeCallbacksAndMessages(null)
+        appStateClearHandler.removeCallbacksAndMessages(null)
+        qrCodeClearHandler.removeCallbacksAndMessages(null)
+        faceClearHandler.removeCallbacksAndMessages(null)
+        wakeScreenHandler.removeCallbacksAndMessages(null)
+        audioPlayer?.let { player ->
+            player.setOnPreparedListener(null)
+            player.setOnCompletionListener(null)
+            player.setOnErrorListener(null)
+            player.release()
+        }
+        audioPlayer = null
+        // LifecycleService dispatches ON_DESTROY here, releasing the TTS engine.
+        super.onDestroy()
     }
 
     override fun onBind(intent: Intent): IBinder {
@@ -493,8 +507,10 @@ class WallPanelService : LifecycleService(), MQTTModule.MQTTListener {
     }
 
     private fun startMJPEG() {
+        if (mjpegObserverAttached) return
         Timber.d("startMJPEG")
         cameraReader?.let {
+            mjpegObserverAttached = true
             it.getJpeg().observe(this, Observer { jpeg ->
                 if (mJpegSockets.size > 0 && jpeg != null) {
                     var i = 0
@@ -551,8 +567,10 @@ class WallPanelService : LifecycleService(), MQTTModule.MQTTListener {
     // TODO we stop entire camera not just streaming
     private fun stopMJPEG() {
         Timber.d("stopMJPEG Called")
+        cameraReader?.getJpeg()?.removeObservers(this)
+        mjpegObserverAttached = false
+        mJpegSockets.forEach { if (it.isOpen) it.end() }
         mJpegSockets.clear()
-        //cameraReader?.getJpeg()?.removeObservers(this)
         httpServer?.removeAction("GET", "/camera/stream")
     }
 
