@@ -96,7 +96,7 @@ class MQTTModule (base: Context?, var mqttOptions: MQTTOptions, private val list
             } catch (e: Mqtt3MessageException) {
                 e.printStackTrace()
             }
-            mqtt5Service = null
+            mqtt3Service = null
         }
     }
 

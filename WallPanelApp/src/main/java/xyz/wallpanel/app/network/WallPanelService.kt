@@ -35,6 +35,7 @@ import androidx.lifecycle.Observer
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import com.koushikdutta.async.AsyncServer
 import com.koushikdutta.async.ByteBufferList
+import com.koushikdutta.async.Util
 import com.koushikdutta.async.http.body.JSONObjectBody
 import com.koushikdutta.async.http.body.StringBody
 import com.koushikdutta.async.http.server.AsyncHttpServer
@@ -98,7 +99,11 @@ class WallPanelService : LifecycleService(), MQTTModule.MQTTListener {
     @Inject
     lateinit var screenUtils: ScreenUtils
 
+    // Socket collections are confined to AndroidAsync's event loop.
     private val mJpegSockets = ArrayList<AsyncHttpServerResponse>()
+    private val mjpegWriting = HashSet<AsyncHttpServerResponse>()
+    private val mjpegSendPending = AtomicBoolean(false)
+    private val commandHandler = Handler(Looper.getMainLooper())
     private var mjpegObserverAttached = false
     private var partialWakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
@@ -204,6 +209,7 @@ class WallPanelService : LifecycleService(), MQTTModule.MQTTListener {
         cameraReader = null
         sensorReader.stopReadings()
         stopPowerOptions()
+        commandHandler.removeCallbacksAndMessages(null)
         reconnectHandler.removeCallbacksAndMessages(null)
         motionClearHandler.removeCallbacksAndMessages(null)
         appStateClearHandler.removeCallbacksAndMessages(null)
@@ -512,24 +518,33 @@ class WallPanelService : LifecycleService(), MQTTModule.MQTTListener {
         cameraReader?.let {
             mjpegObserverAttached = true
             it.getJpeg().observe(this, Observer { jpeg ->
-                if (mJpegSockets.size > 0 && jpeg != null) {
-                    var i = 0
-                    while (i < mJpegSockets.size) {
-                        val s = mJpegSockets[i]
-                        val bb = ByteBufferList()
-                        if (s.isOpen) {
-                            bb.recycle()
-                            bb.add(ByteBuffer.wrap("--jpgboundary\r\nContent-Type: image/jpeg\r\n".toByteArray()))
-                            bb.add(ByteBuffer.wrap(("Content-Length: " + jpeg.size + "\r\n\r\n").toByteArray()))
-                            bb.add(ByteBuffer.wrap(jpeg))
-                            bb.add(ByteBuffer.wrap("\r\n".toByteArray()))
-                            s.write(bb)
-                        } else {
-                            mJpegSockets.removeAt(i)
-                            i--
-                            Timber.i("MJPEG Session Count is " + mJpegSockets.size)
+                if (jpeg != null && mjpegSendPending.compareAndSet(false, true)) {
+                    AsyncServer.getDefault().post {
+                        try {
+                            val iterator = mJpegSockets.iterator()
+                            while (iterator.hasNext()) {
+                                val response = iterator.next()
+                                if (!response.isOpen) {
+                                    iterator.remove()
+                                    mjpegWriting.remove(response)
+                                    continue
+                                }
+                                // Slow clients get the next fresh frame, never an unbounded queue.
+                                if (!mjpegWriting.add(response)) continue
+                                val buffers = ByteBufferList()
+                                buffers.add(ByteBuffer.wrap(("--jpgboundary\r\nContent-Type: image/jpeg\r\n" +
+                                    "Content-Length: " + jpeg.size + "\r\n\r\n").toByteArray()))
+                                buffers.add(ByteBuffer.wrap(jpeg))
+                                buffers.add(ByteBuffer.wrap("\r\n".toByteArray()))
+                                Util.writeAll(response, buffers) { error ->
+                                    mjpegWriting.remove(response)
+                                    if (error != null) response.end()
+                                }
+                            }
+                            cameraReader?.setStreamingEnabled(mJpegSockets.isNotEmpty())
+                        } finally {
+                            mjpegSendPending.set(false)
                         }
-                        i++
                     }
                 }
             })
@@ -569,13 +584,18 @@ class WallPanelService : LifecycleService(), MQTTModule.MQTTListener {
         Timber.d("stopMJPEG Called")
         cameraReader?.getJpeg()?.removeObservers(this)
         mjpegObserverAttached = false
-        mJpegSockets.forEach { if (it.isOpen) it.end() }
-        mJpegSockets.clear()
+        cameraReader?.setStreamingEnabled(false)
+        AsyncServer.getDefault().post {
+            mJpegSockets.forEach { if (it.isOpen) it.end() }
+            mJpegSockets.clear()
+            mjpegWriting.clear()
+        }
         httpServer?.removeAction("GET", "/camera/stream")
     }
 
     private fun startMJPEG(response: AsyncHttpServerResponse) {
         Timber.d("startmJpeg Called")
+        mJpegSockets.removeAll { !it.isOpen }
         if (mJpegSockets.size < configuration.httpMJPEGMaxStreams) {
             Timber.i("Starting new MJPEG stream")
             response.headers.add("Cache-Control", "no-cache")
@@ -585,6 +605,7 @@ class WallPanelService : LifecycleService(), MQTTModule.MQTTListener {
             response.code(200)
             response.writeHead()
             mJpegSockets.add(response)
+            cameraReader?.setStreamingEnabled(true)
         } else {
             Timber.i("MJPEG stream limit was reached, not starting")
             response.send("Max streams exceeded")
@@ -594,6 +615,12 @@ class WallPanelService : LifecycleService(), MQTTModule.MQTTListener {
     }
 
     private fun processCommand(commandJson: JSONObject): Boolean {
+        // MQTT callbacks and AndroidAsync HTTP callbacks may arrive off the main thread.
+        // Camera lifecycle, LiveData observers and MediaPlayer share the main looper.
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            commandHandler.post { processCommand(commandJson) }
+            return true
+        }
         Timber.d("processCommand $commandJson")
         try {
             if (commandJson.has(COMMAND_CAMERA)) {

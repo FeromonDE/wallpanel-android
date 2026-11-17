@@ -63,6 +63,7 @@ class BrowserActivityNative : BaseBrowserActivity(), LifecycleObserver, WebClien
     override var isConnected = true
     private var webkitPermissionRequest: PermissionRequest? = null
     private var awaitingReconnect = false
+    private var browserStopped = false
 
     private val reloadPageRunnable = Runnable {
         initWebPageLoad()
@@ -74,7 +75,7 @@ class BrowserActivityNative : BaseBrowserActivity(), LifecycleObserver, WebClien
     private val playlistRunnable = object : Runnable {
         override fun run() {
             val urls = configuration.appLaunchUrl.lines().map { it.trim() }.filter { it.isNotEmpty() }
-            if (urls.isEmpty() || isFinishing || isDestroyed) return
+            if (urls.isEmpty() || browserStopped || isFinishing || isDestroyed) return
             loadWebViewUrl(urls[playlistIndex % urls.size])
             playlistIndex = (playlistIndex + 1) % urls.size
             val minute = TimeUnit.MINUTES.toMillis(1)
@@ -131,9 +132,11 @@ class BrowserActivityNative : BaseBrowserActivity(), LifecycleObserver, WebClien
             setLightTheme()
         }
 
+        if (!::webView.isInitialized) return
+        webView.onResume()
         if (configuration.hardwareAccelerated) {
-            // chromium, enable hardware acceleration
-            webView.setLayerType(View.LAYER_TYPE_HARDWARE, null)
+            // The window is already accelerated; avoid a permanent extra GPU texture.
+            webView.setLayerType(View.LAYER_TYPE_NONE, null)
         } else {
             // older android version, disable hardware acceleration
             webView.setLayerType(View.LAYER_TYPE_SOFTWARE, null)
@@ -156,10 +159,22 @@ class BrowserActivityNative : BaseBrowserActivity(), LifecycleObserver, WebClien
 
         if (configuration.hasSettingsUpdates()) {
             initWebPageLoad()
+        } else if (browserStopped) {
+            if (awaitingReconnect) {
+                startReloadDelay()
+            } else {
+                val urls = configuration.appLaunchUrl.lines().filter { it.isNotBlank() }
+                if (urls.size > 1) playlistHandler.post(playlistRunnable)
+            }
         }
+        browserStopped = false
     }
 
     override fun onStop() {
+        browserStopped = true
+        playlistHandler.removeCallbacks(playlistRunnable)
+        reconnectionHandler.removeCallbacks(reloadPageRunnable)
+        if (::webView.isInitialized) webView.onPause()
         super.onStop()
         mOnScrollChangedListener?.let {
             binding.swipeContainer.viewTreeObserver.removeOnScrollChangedListener(it)
@@ -275,7 +290,7 @@ class BrowserActivityNative : BaseBrowserActivity(), LifecycleObserver, WebClien
         awaitingReconnect = true
         playlistHandler.removeCallbacks(playlistRunnable)
         reconnectionHandler.removeCallbacks(reloadPageRunnable)
-        reconnectionHandler.postDelayed(reloadPageRunnable, 30000)
+        if (!browserStopped) reconnectionHandler.postDelayed(reloadPageRunnable, 30000)
     }
 
     override fun certPermissionsShown(): Boolean {

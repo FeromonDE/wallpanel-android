@@ -20,8 +20,6 @@ import android.util.SparseArray
 
 import com.google.android.gms.vision.Detector
 import com.google.android.gms.vision.Frame
-import com.jjoe64.motiondetection.motiondetection.AggregateLumaMotionDetection
-import com.jjoe64.motiondetection.motiondetection.ImageProcessing
 import xyz.wallpanel.app.modules.Motion.Companion.MOTION_DETECTED
 import xyz.wallpanel.app.modules.Motion.Companion.MOTION_NOT_DETECTED
 import xyz.wallpanel.app.modules.Motion.Companion.MOTION_TOO_DARK
@@ -33,54 +31,22 @@ import timber.log.Timber
  */
 class MotionDetector private constructor(private val minLuma: Int, private val motionLeniency: Int) : Detector<Motion>() {
 
-    private var aggregateLumaMotionDetection: AggregateLumaMotionDetection? = null
-
-    init {
-        aggregateLumaMotionDetection = AggregateLumaMotionDetection()
-        aggregateLumaMotionDetection!!.setLeniency(motionLeniency)
-    }
+    private val lumaDetector = LumaMotionDetector(minLuma, motionLeniency)
 
     override fun detect(frame: Frame?): SparseArray<Motion> {
-        if (frame == null) {
-            throw IllegalArgumentException("No frame supplied.")
-        } else {
-            val byteBuffer = frame.grayscaleImageData
-            val bytes = byteBuffer.array()
-            val w = frame.metadata.width
-            val h = frame.metadata.height
-            val sparseArray = SparseArray<Motion>()
-            val motion = Motion()
-            motion.byteArray = bytes
-            motion.width = w
-            motion.height = h
-
-            val img = ImageProcessing.decodeYUV420SPtoLuma(bytes, w, h)
-            var lumaSum = 0
-            for (i in img) {
-                lumaSum += i
-            }
-            if (lumaSum < minLuma) {
-                motion.type = MOTION_TOO_DARK
-                sparseArray.put(0, motion)
-                return sparseArray
-            }
-
-            try {
-                val motionDetected = aggregateLumaMotionDetection!!.detect(img, w, h)
-                if (motionDetected) {
-                    motion.type = MOTION_DETECTED
-                    //Timber.d("MOTION_DETECTED")
-                } else {
-                    motion.type = MOTION_NOT_DETECTED
-                    //Timber.d("MOTION_NOT_DETECTED")
-                }
-            } catch (e: Exception) {
-                Timber.e(e.message)
-                motion.type = MOTION_NOT_DETECTED
-            }
-            sparseArray.put(0, motion)
-            return sparseArray
+        requireNotNull(frame) { "No frame supplied." }
+        val width = frame.metadata.width
+        val height = frame.metadata.height
+        val result = lumaDetector.detect(frame.grayscaleImageData.array(), width, height)
+        val motion = Motion()
+        motion.width = width
+        motion.height = height
+        motion.type = when (result) {
+            LumaMotionDetector.TOO_DARK -> MOTION_TOO_DARK
+            LumaMotionDetector.MOTION -> MOTION_DETECTED
+            else -> MOTION_NOT_DETECTED
         }
+        return SparseArray<Motion>(1).apply { put(0, motion) }
     }
 
     class Builder(private val minLuma: Int, private val motionLeniency: Int) {

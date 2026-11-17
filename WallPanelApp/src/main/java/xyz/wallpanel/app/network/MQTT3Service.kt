@@ -18,6 +18,8 @@ package xyz.wallpanel.app.network
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.os.Handler
+import android.os.Looper
 import android.text.TextUtils
 import com.hivemq.client.mqtt.MqttClient
 import com.hivemq.client.mqtt.MqttGlobalPublishFilter
@@ -51,6 +53,14 @@ class MQTT3Service(
     private var mqtt3AsyncClient: Mqtt3AsyncClient? = null
     private var mqttOptions: MQTTOptions? = null
     private val mReady = AtomicBoolean(false)
+    private val callbackHandler = Handler(Looper.getMainLooper())
+    @Volatile private var clientGeneration = 0
+
+    private fun notifyListener(generation: Int = clientGeneration, action: (IMqttManagerListener) -> Unit) {
+        callbackHandler.post {
+            if (generation == clientGeneration) listener?.let(action)
+        }
+    }
 
     init {
         initialize(options)
@@ -77,21 +87,30 @@ class MQTT3Service(
     @Throws(Mqtt3MessageException::class)
     override fun close() {
         Timber.d("close")
-
-        mqtt3AsyncClient?.let {
-
-            mqttOptions?.let {
-                val offlineMessage =
-                    Mqtt3Publish.builder().topic("${it.getBaseTopic()}${CONNECTION}")
-                        .payload(OFFLINE.toByteArray()).retain(true).build()
-                sendMessage(offlineMessage)
-            }
-
-            mqtt3AsyncClient = null
-            listener = null
-            mqttOptions = null
-        }
+        // Invalidate callbacks before disconnecting; they must not restart a stopped service.
+        clientGeneration++
+        callbackHandler.removeCallbacksAndMessages(null)
+        val client = mqtt3AsyncClient
+        val options = mqttOptions
+        mqtt3AsyncClient = null
+        listener = null
+        mqttOptions = null
         mReady.set(false)
+        if (client != null) {
+            try {
+                if (client.state.isConnected && options != null) {
+                    val offline = Mqtt3Publish.builder()
+                        .topic("${options.getBaseTopic()}${CONNECTION}")
+                        .payload(OFFLINE.toByteArray()).retain(true).build()
+                    client.publish(offline).whenComplete { _, _ -> client.disconnect() }
+                } else {
+                    client.disconnect()
+                }
+            } catch (e: RuntimeException) {
+                Timber.w(e, "Could not gracefully close MQTT client")
+                client.disconnect()
+            }
+        }
     }
 
     override fun publish(topic: String, payload: String, retain: Boolean) {
@@ -120,7 +139,6 @@ class MQTT3Service(
             Timber.i("Service Configuration:")
             Timber.i("Client ID: %s", mqttOptions!!.getClientId())
             Timber.i("Username: %s", mqttOptions!!.getUsername())
-            Timber.i("Password: %s", mqttOptions!!.getPassword())
             Timber.i("TslConnect: %s", mqttOptions!!.getTlsConnection())
             Timber.i("MQTT Configuration:")
             Timber.i("Broker: %s", mqttOptions?.brokerUrl)
@@ -156,11 +174,17 @@ class MQTT3Service(
         try {
             mqttOptions?.let { mqttOptions ->
 
+                val generation = ++clientGeneration
+                var createdClient: Mqtt3AsyncClient? = null
                 val mqttBuilder = MqttClient.builder().identifier(mqttOptions.getClientId())
                     .serverHost(mqttOptions.getBroker()).serverPort(mqttOptions.getPort())
                 mqttBuilder.addConnectedListener { context: MqttClientConnectedContext? ->
+                    if (generation != clientGeneration) {
+                        createdClient?.disconnect()
+                        return@addConnectedListener
+                    }
                     Timber.d("connect to broker completed")
-                    subscribeToTopics(mqttOptions.getStateTopics())
+                    subscribeToTopics(mqttOptions.getStateTopics(), generation)
 
                     val onlineMessage =
                         Mqtt3Publish.builder().topic("${mqttOptions.getBaseTopic()}${CONNECTION}")
@@ -169,22 +193,26 @@ class MQTT3Service(
 
                     // TODO: There needs to be a way to handle queues...
                     mReady.set(true)
-                    listener?.handleMqttConnected()
+                    notifyListener(generation) { it.handleMqttConnected() }
                 }
                 mqttBuilder.addDisconnectedListener { context: MqttClientDisconnectedContext? ->
+                    if (generation != clientGeneration) return@addDisconnectedListener
                     mReady.set(false)
-                    listener?.handleMqttDisconnected()
+                    notifyListener(generation) { it.handleMqttDisconnected() }
                     mqttOptions.let {
                         Timber.e(
                             "Disconnected from: %s, exception: %s",
                             it.brokerUrl,
                             context?.cause?.message
                         )
-                        listener?.handleMqttException("Error establishing MQTT connection to MQTT broker with address ${mqttOptions.brokerUrl}.")
+                        notifyListener(generation) {
+                            it.handleMqttException("Error establishing MQTT connection to MQTT broker with address ${mqttOptions.brokerUrl}.")
+                        }
                     }
                 }
 
-                mqtt3AsyncClient = mqttBuilder.useMqttVersion3().build().toAsync()
+                createdClient = mqttBuilder.useMqttVersion3().build().toAsync()
+                mqtt3AsyncClient = createdClient
                 val clientConnect = mqtt3AsyncClient!!.connectWith()
                 clientConnect.cleanSession(false)
                 clientConnect.willPublish().topic("${mqttOptions.getBaseTopic()}${CONNECTION}")
@@ -195,10 +223,10 @@ class MQTT3Service(
                     clientConnect.simpleAuth().username(mqttOptions.getUsername())
                         .password(mqttOptions.getPassword().toByteArray()).applySimpleAuth()
                 }
-                val isConnected = clientConnect.send()
-                if (isConnected.isDone) {
-                    mReady.set(true)
-                    return
+                clientConnect.send().whenComplete { _, error ->
+                    if (error != null) notifyListener(generation) {
+                        it.handleMqttException("Failed to connect: ${error.message}")
+                    }
                 }
             }
         } catch (e: IllegalArgumentException) {
@@ -233,19 +261,21 @@ class MQTT3Service(
     }
 
     //@TargetApi(Build.VERSION_CODES.N)
-    private fun subscribeToTopics(topicFilters: Array<String>?) {
+    private fun subscribeToTopics(topicFilters: Array<String>?, generation: Int) {
         topicFilters?.let {
             Timber.d("Subscribe to Topics: %s", topicFilters.convertArrayToString())
             mqtt3AsyncClient?.let {
                 try {
-                    it.subscribeWith().topicFilter(topicFilters.convertArrayToString()).send()
                     it.publishes(MqttGlobalPublishFilter.ALL) { publish ->
-                        listener?.subscriptionMessage(
-                            it.config.clientIdentifier.get().toString(),
-                            publish.topic.toString(),
-                            UTF_8.decode(publish.payload.get()).toString()
-                        )
+                        val clientId = it.config.clientIdentifier.get().toString()
+                        val topic = publish.topic.toString()
+                        val payload = String(publish.payloadAsBytes, Charsets.UTF_8)
+                        notifyListener(generation) { target ->
+                            target.subscriptionMessage(clientId, topic, payload)
+                        }
                     }
+                    // Register the consumer first so retained messages cannot be missed.
+                    it.subscribeWith().topicFilter(topicFilters.convertArrayToString()).send()
                 } catch (e: NullPointerException) {
                     Timber.e(e)
                 } catch (e: Mqtt3MessageException) {
