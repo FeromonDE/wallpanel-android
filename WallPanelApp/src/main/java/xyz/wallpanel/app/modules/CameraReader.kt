@@ -263,6 +263,9 @@ constructor(private val context: Context) {
                     override fun onUpdate(p0: Detector.Detections<Stream>, stream: Stream) {
                         if (!streamingEnabled) return
                         val frame = stream.byteArray ?: return
+                        val width = stream.width ?: return
+                        val height = stream.height ?: return
+                        if (width <= 0 || height <= 0) return
                         val now = SystemClock.elapsedRealtime()
                         if (now < nextJpegFrameAt) return
                         val displayRotation = when (windowManager.defaultDisplay.rotation) {
@@ -272,7 +275,7 @@ constructor(private val context: Context) {
                             else -> 0
                         }
                         val rotation = cameraOrientation - displayRotation + configuration.cameraRotate.toInt()
-                        if (worker.submit(frame, stream.width, stream.height, rotation)) {
+                        if (worker.submit(frame, width, height, rotation)) {
                             nextJpegFrameAt = now + frameDelay
                         }
                     }
